@@ -7,6 +7,7 @@ import threading
 import time
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -53,6 +54,19 @@ PORT = int(os.getenv("PORT", "10000"))
 RETRY_DELAY = max(5, int(os.getenv("RETRY_DELAY", "20")))
 MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES", "1")))
 
+# SPEED SETTINGS
+DOWNLOAD_WORKERS = max(
+    1, min(16, int(os.getenv("DOWNLOAD_WORKERS", "8")))
+)
+
+DOWNLOAD_CHUNK_MB = max(
+    2, min(32, int(os.getenv("DOWNLOAD_CHUNK_MB", "8")))
+)
+
+TELEGRAM_UPLOAD_WORKERS = max(
+    1, min(16, int(os.getenv("TELEGRAM_UPLOAD_WORKERS", "8")))
+)
+
 WORK_DIR = Path(os.getenv("WORK_DIR", "temp_downloads"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -64,7 +78,18 @@ USER_AGENT = (
 
 
 # ============================================================
-# HEALTH CHECK SERVER
+# LOGGING
+# ============================================================
+
+def log(message):
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}",
+        flush=True
+    )
+
+
+# ============================================================
+# FLASK HEALTH SERVER
 # ============================================================
 
 web_app = Flask(__name__)
@@ -76,6 +101,7 @@ def health():
 
 
 def run_web_server():
+    log("[SERVER] Starting health server.")
     web_app.run(host="0.0.0.0", port=PORT)
 
 
@@ -86,7 +112,7 @@ def run_web_server():
 client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
-    API_HASH,
+    API_HASH
 )
 
 
@@ -108,10 +134,11 @@ def format_duration(seconds):
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
 
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-    return f"{minutes:02d}:{secs:02d}"
+    return (
+        f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        if hours
+        else f"{minutes:02d}:{secs:02d}"
+    )
 
 
 def format_size(size):
@@ -122,9 +149,11 @@ def format_size(size):
 
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
-            if unit == "B":
-                return f"{int(value)} B"
-            return f"{value:.2f} {unit}"
+            return (
+                f"{value:.2f} {unit}"
+                if unit != "B"
+                else f"{int(value)} B"
+            )
 
         value /= 1024
 
@@ -148,6 +177,18 @@ def load_urls():
         ]
 
 
+def cleanup_files():
+    log("[CLEANUP] Removing temporary files.")
+
+    for item in WORK_DIR.iterdir():
+        if item.is_file():
+            try:
+                item.unlink()
+                log(f"[CLEANUP] Deleted: {item.name}")
+            except Exception as exc:
+                log(f"[CLEANUP ERROR] {item.name}: {exc}")
+
+
 # ============================================================
 # GITHUB PROGRESS LOGGER
 # ============================================================
@@ -166,39 +207,42 @@ def github_api_url():
 
 def save_github_record(index, status, title, source_url, details=""):
     """
-    Save one processing record to GitHub.
-
+    Saves every result to GitHub.
     Existing records are preserved.
-    A SHA conflict causes a fresh GET and retry.
-    This function does not decide which queue items to skip.
+    GitHub log is not used to skip queue items.
     """
 
     api_url = github_api_url()
 
     if not GITHUB_TOKEN or not api_url:
-        print(
-            "[GitHub] Not configured; record was not saved remotely.",
-            flush=True
-        )
+        log("[GITHUB] Not configured; record was not saved remotely.")
         return False
 
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "X-GitHub-Api-Version": "2022-11-28",
+        "X-GitHub-Api-Version": "2022-11-28"
     }
 
     safe_title = clean_text(title, 300).replace("\t", " ")
     safe_url = clean_text(source_url, 1000).replace("\t", " ")
     safe_details = clean_text(details, 500).replace("\t", " ")
 
-    line = f"{index}\t{status}\t{safe_title}\t{safe_url}"
+    line = (
+        f"{index}\t{status}\t{safe_title}\t{safe_url}"
+    )
 
     if safe_details:
         line += f"\t{safe_details}"
 
     for attempt in range(1, 6):
+
         try:
+            log(
+                f"[GITHUB] Reading current file "
+                f"(attempt {attempt}/5)."
+            )
+
             response = requests.get(
                 api_url,
                 headers=headers,
@@ -213,7 +257,9 @@ def save_github_record(index, status, title, source_url, details=""):
                 payload = response.json()
                 sha = payload.get("sha")
 
-                encoded = payload.get("content", "").replace("\n", "")
+                encoded = payload.get(
+                    "content", ""
+                ).replace("\n", "")
 
                 old_content = base64.b64decode(
                     encoded
@@ -228,13 +274,10 @@ def save_github_record(index, status, title, source_url, details=""):
             elif response.status_code != 404:
                 response.raise_for_status()
 
-            # Replace an existing record for this index.
-            # Do not use this log to skip queue items.
             prefix = f"{index}\t"
 
             old_lines = [
-                row
-                for row in old_lines
+                row for row in old_lines
                 if not row.startswith(prefix)
             ]
 
@@ -247,11 +290,13 @@ def save_github_record(index, status, title, source_url, details=""):
                 "content": base64.b64encode(
                     new_content
                 ).decode("ascii"),
-                "branch": GITHUB_BRANCH,
+                "branch": GITHUB_BRANCH
             }
 
             if sha:
                 body["sha"] = sha
+
+            log(f"[GITHUB] Updating item {index}: {status}")
 
             saved = requests.put(
                 api_url,
@@ -261,60 +306,48 @@ def save_github_record(index, status, title, source_url, details=""):
             )
 
             if saved.status_code in (409, 422) and attempt < 5:
-                print(
-                    f"[GitHub] SHA conflict for item {index}; "
-                    f"refreshing and retrying ({attempt}/5).",
-                    flush=True
+                log(
+                    f"[GITHUB] SHA conflict for item {index}; "
+                    f"refreshing and retrying."
                 )
-
                 time.sleep(min(attempt * 2, 8))
                 continue
 
             saved.raise_for_status()
 
-            print(
-                f"[GitHub] Saved item {index}: {status}",
-                flush=True
+            log(
+                f"[GITHUB] Successfully saved item "
+                f"{index}: {status}"
             )
 
             return True
 
         except requests.RequestException as exc:
-            if attempt < 5:
-                print(
-                    f"[GitHub] Attempt {attempt}/5 failed "
-                    f"for item {index}: {exc}",
-                    flush=True
-                )
 
+            if attempt < 5:
+                log(
+                    f"[GITHUB] Attempt {attempt}/5 failed: {exc}"
+                )
                 time.sleep(min(attempt * 2, 8))
                 continue
 
-            print(
-                f"[GitHub] Save failed for item {index}: {exc}",
-                flush=True
-            )
-
+            log(f"[GITHUB ERROR] {exc}")
             return False
 
         except Exception as exc:
-            print(
-                f"[GitHub] Save failed for item {index}: {exc}",
-                flush=True
-            )
+            log(f"[GITHUB ERROR] {exc}")
             return False
 
     return False
 
 
 # ============================================================
-# PAGE METADATA AND DIRECT MP4 EXTRACTION
+# EXTRACT WEBPAGE INFORMATION
 # ============================================================
 
 def extract_page_metadata(page_url, session):
-    """
-    Read publicly exposed page metadata and direct MP4 URLs.
-    """
+
+    log("[PAGE] Requesting webpage.")
 
     response = session.get(
         page_url,
@@ -322,17 +355,19 @@ def extract_page_metadata(page_url, session):
         allow_redirects=True
     )
 
+    log(f"[PAGE] HTTP status: {response.status_code}")
+
     response.raise_for_status()
 
     html = response.text
+
+    log(f"[PAGE] HTML received: {format_size(len(html))}")
 
     normalized = (
         unescape(html)
         .replace(r"\/", "/")
         .replace(r"\u0026", "&")
     )
-
-    candidates = []
 
     pattern = (
         r"""(?:https?:)?//[^\"'<>\s]+?\.mp4(?:\?[^\"'<>\s]*)?"""
@@ -345,7 +380,10 @@ def extract_page_metadata(page_url, session):
         flags=re.IGNORECASE
     )
 
+    video_urls = []
+
     for value in matches:
+
         value = value.strip().rstrip("),;")
 
         if value.startswith("//"):
@@ -353,8 +391,8 @@ def extract_page_metadata(page_url, session):
 
         candidate = urljoin(response.url, value)
 
-        if candidate not in candidates:
-            candidates.append(candidate)
+        if candidate not in video_urls:
+            video_urls.append(candidate)
 
     title_match = re.search(
         r'<meta[^>]+property=["\']og:title["\']'
@@ -390,7 +428,14 @@ def extract_page_metadata(page_url, session):
         else None
     )
 
-    return title, candidates, poster_url, response.url
+    log(f"[PAGE] Title: {title}")
+    log(f"[PAGE] MP4 links found: {len(video_urls)}")
+    log(
+        f"[PAGE] Poster found: "
+        f"{'YES' if poster_url else 'NO'}"
+    )
+
+    return title, video_urls, poster_url, response.url
 
 
 # ============================================================
@@ -398,9 +443,8 @@ def extract_page_metadata(page_url, session):
 # ============================================================
 
 def probe_video(path):
-    """
-    Read duration and dimensions using ffprobe, if installed.
-    """
+
+    log("[INFO] Checking video information.")
 
     try:
         result = subprocess.run(
@@ -432,27 +476,25 @@ def probe_video(path):
         width = int(stream.get("width") or 0)
         height = int(stream.get("height") or 0)
 
+        log(
+            f"[INFO] Duration: {format_duration(duration)} | "
+            f"Resolution: {width}x{height}"
+        )
+
         return duration, width, height
 
-    except Exception:
+    except Exception as exc:
+        log(f"[INFO] ffprobe unavailable or failed: {exc}")
         return 0, 0, 0
 
 
 # ============================================================
-# VIDEO DOWNLOADER
+# PARALLEL VIDEO DOWNLOADER
 # ============================================================
 
 def download_video(page_url):
-    """
-    Download a direct MP4 URL exposed in the public webpage HTML.
 
-    This does not bypass DRM, login, paywalls, or access controls.
-    """
-
-    # Clean previous temporary files.
-    for item in WORK_DIR.iterdir():
-        if item.is_file():
-            item.unlink(missing_ok=True)
+    cleanup_files()
 
     session = requests.Session()
 
@@ -460,7 +502,10 @@ def download_video(page_url):
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
+        "Connection": "keep-alive"
     })
+
+    log("[1/6] Fetching webpage.")
 
     title, video_urls, poster_url, final_page_url = (
         extract_page_metadata(page_url, session)
@@ -468,79 +513,387 @@ def download_video(page_url):
 
     if not video_urls:
         raise RuntimeError(
-            "No direct MP4 URL was found in the public webpage HTML. "
-            "The player may load its source dynamically. "
-            "This script does not bypass protections."
+            "No direct MP4 URL found in webpage HTML. "
+            "The player may load its source dynamically."
         )
 
-    last_error = None
+    referer = (
+        "https://bindasmood.com/"
+        if "bindasmood.com" in urlparse(final_page_url).netloc.lower()
+        else final_page_url
+    )
+
+    common_headers = {
+        "Referer": referer,
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive"
+    }
+
     video_file = WORK_DIR / "video.mp4"
+    last_error = None
+    downloaded_ok = False
 
-    for video_url in video_urls:
+    for source_no, video_url in enumerate(video_urls, start=1):
+
+        log(
+            f"[CDN] Source {source_no}/{len(video_urls)}: "
+            f"{urlparse(video_url).netloc}"
+        )
+
         try:
-            source_host = urlparse(final_page_url).netloc.lower()
+            # Test HTTP byte-range support.
+            probe_headers = dict(common_headers)
+            probe_headers["Range"] = "bytes=0-0"
 
-            if "bindasmood.com" in source_host:
-                referer = "https://bindasmood.com/"
-            else:
-                referer = final_page_url
-
-            headers = {
-                "Referer": referer,
-                "User-Agent": USER_AGENT,
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-            }
-
-            with session.get(
+            with requests.get(
                 video_url,
-                headers=headers,
+                headers=probe_headers,
                 stream=True,
-                timeout=(30, 120)
-            ) as response:
+                timeout=(20, 60),
+                allow_redirects=True
+            ) as probe:
 
-                response.raise_for_status()
+                log(f"[CDN] Range probe HTTP {probe.status_code}")
 
-                content_type = response.headers.get(
+                probe.raise_for_status()
+
+                content_type = probe.headers.get(
                     "Content-Type", ""
                 ).lower()
+
+                content_range = probe.headers.get(
+                    "Content-Range", ""
+                )
+
+                match = re.match(
+                    r"bytes\s+0-0/(\d+)",
+                    content_range,
+                    re.I
+                )
+
+                total_size = int(match.group(1)) if match else 0
+
+                range_supported = (
+                    probe.status_code == 206
+                    and bool(total_size)
+                )
 
                 if "text/html" in content_type:
                     raise RuntimeError(
                         "CDN returned HTML instead of video."
                     )
 
-                with video_file.open("wb") as output:
-                    for chunk in response.iter_content(
-                        chunk_size=1024 * 1024
-                    ):
-                        if chunk:
-                            output.write(chunk)
+                for _ in probe.iter_content(chunk_size=1):
+                    break
+
+            # ------------------------------------------------
+            # PARALLEL DOWNLOAD
+            # ------------------------------------------------
 
             if (
-                not video_file.exists()
-                or video_file.stat().st_size == 0
+                range_supported
+                and DOWNLOAD_WORKERS > 1
+                and total_size > 1
             ):
-                raise RuntimeError(
-                    "The CDN response contained no video data."
+
+                workers = min(
+                    DOWNLOAD_WORKERS,
+                    max(
+                        1,
+                        (total_size + 1)
+                        // (DOWNLOAD_CHUNK_MB * 1024 * 1024)
+                    )
                 )
 
-            break
+                chunk_size = max(
+                    DOWNLOAD_CHUNK_MB * 1024 * 1024,
+                    (total_size + workers - 1) // workers
+                )
+
+                ranges = []
+                start_byte = 0
+
+                while start_byte < total_size:
+
+                    end_byte = min(
+                        total_size - 1,
+                        start_byte + chunk_size - 1
+                    )
+
+                    ranges.append((start_byte, end_byte))
+                    start_byte = end_byte + 1
+
+                actual_workers = min(workers, len(ranges))
+
+                log(
+                    f"[DOWNLOAD] Parallel mode enabled. "
+                    f"Size={format_size(total_size)}, "
+                    f"workers={actual_workers}, "
+                    f"parts={len(ranges)}"
+                )
+
+                fd = os.open(
+                    str(video_file),
+                    os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+                    0o644
+                )
+
+                os.ftruncate(fd, total_size)
+
+                progress_lock = threading.Lock()
+
+                progress = {
+                    "bytes": 0,
+                    "last": -1
+                }
+
+                def fetch_range(byte_range):
+
+                    start_byte, end_byte = byte_range
+
+                    headers = dict(common_headers)
+
+                    headers["Range"] = (
+                        f"bytes={start_byte}-{end_byte}"
+                    )
+
+                    expected = end_byte - start_byte + 1
+                    received = 0
+
+                    with requests.get(
+                        video_url,
+                        headers=headers,
+                        stream=True,
+                        timeout=(20, 120),
+                        allow_redirects=True
+                    ) as part_response:
+
+                        if part_response.status_code != 206:
+                            raise RuntimeError(
+                                f"Range {start_byte}-{end_byte} "
+                                f"returned HTTP "
+                                f"{part_response.status_code}, "
+                                f"expected 206."
+                            )
+
+                        part_response.raise_for_status()
+
+                        actual_range = part_response.headers.get(
+                            "Content-Range", ""
+                        )
+
+                        if not actual_range.lower().startswith(
+                            f"bytes {start_byte}-{end_byte}/"
+                        ):
+                            raise RuntimeError(
+                                f"Unexpected Content-Range: "
+                                f"{actual_range}"
+                            )
+
+                        for data in part_response.iter_content(
+                            chunk_size=1024 * 1024
+                        ):
+
+                            if not data:
+                                continue
+
+                            view = memoryview(data)
+                            offset = start_byte + received
+
+                            while view:
+
+                                written = os.pwrite(
+                                    fd,
+                                    view,
+                                    offset
+                                )
+
+                                if written <= 0:
+                                    raise OSError(
+                                        "Could not write downloaded range."
+                                    )
+
+                                view = view[written:]
+                                offset += written
+
+                            received += len(data)
+
+                            with progress_lock:
+
+                                progress["bytes"] += len(data)
+
+                                percent = int(
+                                    progress["bytes"] * 100 / total_size
+                                )
+
+                                if (
+                                    percent >= progress["last"] + 5
+                                    or percent == 100
+                                ):
+
+                                    progress["last"] = (
+                                        percent // 5
+                                    ) * 5
+
+                                    log(
+                                        f"[DOWNLOAD] {percent}% | "
+                                        f"{format_size(progress['bytes'])} / "
+                                        f"{format_size(total_size)}"
+                                    )
+
+                    if received != expected:
+                        raise RuntimeError(
+                            f"Range {start_byte}-{end_byte} "
+                            f"incomplete: {received}/{expected} bytes."
+                        )
+
+                    return received
+
+                try:
+
+                    with ThreadPoolExecutor(
+                        max_workers=actual_workers
+                    ) as pool:
+
+                        futures = [
+                            pool.submit(fetch_range, byte_range)
+                            for byte_range in ranges
+                        ]
+
+                        for future in as_completed(futures):
+                            future.result()
+
+                    os.fsync(fd)
+
+                finally:
+                    os.close(fd)
+
+                if video_file.stat().st_size != total_size:
+                    raise RuntimeError(
+                        "Parallel download produced an incorrect file size."
+                    )
+
+                downloaded_ok = True
+
+                log(
+                    f"[DOWNLOAD] Parallel download complete: "
+                    f"{format_size(total_size)}"
+                )
+
+            # ------------------------------------------------
+            # SINGLE CONNECTION FALLBACK
+            # ------------------------------------------------
+
+            else:
+
+                log(
+                    "[DOWNLOAD] Byte ranges unavailable. "
+                    "Using normal streaming download."
+                )
+
+                with requests.get(
+                    video_url,
+                    headers=common_headers,
+                    stream=True,
+                    timeout=(30, 180),
+                    allow_redirects=True
+                ) as response:
+
+                    log(f"[CDN] HTTP {response.status_code}")
+
+                    response.raise_for_status()
+
+                    content_type = response.headers.get(
+                        "Content-Type", ""
+                    ).lower()
+
+                    if "text/html" in content_type:
+                        raise RuntimeError(
+                            "CDN returned HTML instead of video."
+                        )
+
+                    total_size = int(
+                        response.headers.get("Content-Length", 0)
+                    )
+
+                    downloaded = 0
+                    last_percent = -1
+
+                    with video_file.open("wb") as output:
+
+                        for chunk in response.iter_content(
+                            chunk_size=4 * 1024 * 1024
+                        ):
+
+                            if not chunk:
+                                continue
+
+                            output.write(chunk)
+                            downloaded += len(chunk)
+
+                            if total_size:
+
+                                percent = int(
+                                    downloaded * 100 / total_size
+                                )
+
+                                if (
+                                    percent >= last_percent + 5
+                                    or percent == 100
+                                ):
+
+                                    last_percent = (
+                                        percent // 5
+                                    ) * 5
+
+                                    log(
+                                        f"[DOWNLOAD] {percent}% | "
+                                        f"{format_size(downloaded)} / "
+                                        f"{format_size(total_size)}"
+                                    )
+
+                    if downloaded == 0:
+                        raise RuntimeError(
+                            "Downloaded file is empty."
+                        )
+
+                    if total_size and downloaded != total_size:
+                        raise RuntimeError(
+                            f"Incomplete download: "
+                            f"{downloaded}/{total_size} bytes."
+                        )
+
+                downloaded_ok = True
+
+            if downloaded_ok:
+                break
 
         except Exception as exc:
+
             last_error = exc
+
             video_file.unlink(missing_ok=True)
 
-    else:
+            log(f"[CDN ERROR] {exc}")
+
+    if not downloaded_ok:
         raise RuntimeError(
             f"Could not download any MP4 source: {last_error}"
         )
 
-    # Download webpage poster.
+    # --------------------------------------------------------
+    # THUMBNAIL
+    # --------------------------------------------------------
+
     thumb_file = None
 
     if poster_url:
+
         try:
+            log("[THUMBNAIL] Downloading poster.")
+
             poster_response = session.get(
                 poster_url,
                 headers={"Referer": final_page_url},
@@ -554,25 +907,35 @@ def download_video(page_url):
             raw_poster.write_bytes(poster_response.content)
 
             with Image.open(raw_poster) as image:
+
                 image.convert("RGB").save(
                     WORK_DIR / "poster.jpg",
                     "JPEG",
-                    quality=90
+                    quality=88
                 )
 
             raw_poster.unlink(missing_ok=True)
 
             thumb_file = WORK_DIR / "poster.jpg"
 
+            log("[THUMBNAIL] Ready.")
+
         except Exception as exc:
-            print(
-                f"[Thumbnail] Page poster unavailable: {exc}",
-                flush=True
-            )
+            log(f"[THUMBNAIL] Skipped: {exc}")
+
+    # --------------------------------------------------------
+    # VIDEO METADATA
+    # --------------------------------------------------------
 
     duration, width, height = probe_video(video_file)
 
     size = video_file.stat().st_size
+
+    log(
+        f"[VIDEO] Ready: {format_size(size)} | "
+        f"{format_duration(duration)} | "
+        f"{width}x{height}"
+    )
 
     return {
         "path": video_file,
@@ -581,15 +944,16 @@ def download_video(page_url):
         "duration": duration,
         "width": width,
         "height": height,
-        "size": size,
+        "size": size
     }
 
 
 # ============================================================
-# TELEGRAM UPLOAD
+# TELEGRAM UPLOAD PROGRESS
 # ============================================================
 
 def upload_progress(current, total):
+
     if total <= 0:
         return
 
@@ -604,23 +968,25 @@ def upload_progress(current, total):
     step = (percent // 5) * 5
 
     if step >= previous + 5 or percent >= 100:
+
         upload_progress.last_percent = step
 
-        print(
-            f"[Upload] {format_size(current)} / "
-            f"{format_size(total)} ({percent}%)",
-            flush=True
+        log(
+            f"[TELEGRAM UPLOAD] {percent}% | "
+            f"{format_size(current)} / {format_size(total)}"
         )
 
 
+# ============================================================
+# TELEGRAM UPLOAD
+# ============================================================
+
 async def upload_to_telegram(metadata, source_url):
+
     title = metadata["title"]
 
-    caption = (
-        f"**{title}**\n\n"
-        f"📦 Size: `{format_size(metadata['size'])}`\n"
-        f"⏱ Duration: `{format_duration(metadata['duration'])}`"
-    )
+    # Empty caption: no title, file size, or duration text.
+    caption = ""
 
     attributes = []
 
@@ -629,6 +995,7 @@ async def upload_to_telegram(metadata, source_url):
         and metadata["width"] > 0
         and metadata["height"] > 0
     ):
+
         attributes.append(
             DocumentAttributeVideo(
                 duration=metadata["duration"],
@@ -643,27 +1010,44 @@ async def upload_to_telegram(metadata, source_url):
     if GROUP_LINK.startswith(
         ("https://t.me/", "http://t.me/")
     ):
+
         buttons = [
             [Button.url(JOIN_BUTTON_TEXT, GROUP_LINK)]
         ]
 
+    log(
+        f"[TELEGRAM] Uploading {format_size(metadata['size'])} "
+        f"using {TELEGRAM_UPLOAD_WORKERS} workers."
+    )
+
     upload_progress.last_percent = -5
+
+    # Concurrent Telegram file-part upload.
+    uploaded_file = await client.upload_file(
+        str(metadata["path"]),
+        file_size=metadata["size"],
+        file_name=f"{title}.mp4",
+        workers=TELEGRAM_UPLOAD_WORKERS,
+        progress_callback=upload_progress
+    )
+
+    log("[TELEGRAM] File transfer finished. Sending to channel.")
 
     await client.send_file(
         entity=CHANNEL_ID,
-        file=str(metadata["path"]),
+        file=uploaded_file,
         thumb=(
             str(metadata["thumbnail"])
             if metadata["thumbnail"]
             else None
         ),
         caption=caption,
-        parse_mode="md",
         supports_streaming=True,
         attributes=attributes or None,
-        buttons=buttons,
-        progress_callback=upload_progress
+        buttons=buttons
     )
+
+    log("[TELEGRAM] Upload and message send completed.")
 
 
 # ============================================================
@@ -678,31 +1062,44 @@ async def main():
         or not SESSION_STRING
         or not CHANNEL_ID_RAW
     ):
+
         raise RuntimeError(
-            "Missing API_ID, API_HASH, SESSION_STRING, "
+            "Missing API_ID, API_HASH, SESSION_STRING "
             "or CHANNEL_ID environment variable."
         )
 
     if not GROUP_LINK.startswith(
         ("https://t.me/", "http://t.me/")
     ):
-        print(
-            "[Config] GROUP_LINK is not a Telegram link; "
-            "Join Group button will be omitted."
+
+        log(
+            "[CONFIG] GROUP_LINK is not a Telegram link. "
+            "Join button will be omitted."
         )
 
     urls = load_urls()
+
     total = len(urls)
 
-    print(
-        f"[Queue] Loaded {total} URLs from {PAGES_FILE}.",
-        flush=True
+    log("========================================")
+    log("[BOT] TELEGRAM VIDEO UPLOADER STARTED")
+    log(f"[QUEUE] Total URLs: {total}")
+    log(f"[QUEUE] Starting item: {START_FROM}")
+    log(
+        f"[SPEED] Download workers: {DOWNLOAD_WORKERS}"
     )
+    log(
+        f"[SPEED] Download chunk: {DOWNLOAD_CHUNK_MB} MB"
+    )
+    log(
+        f"[SPEED] Telegram upload workers: "
+        f"{TELEGRAM_UPLOAD_WORKERS}"
+    )
+    log("========================================")
 
     if START_FROM > total:
-        print(
-            f"[Queue] START_FROM={START_FROM} is beyond "
-            f"the {total} available URLs."
+        log(
+            "[QUEUE] START_FROM is beyond available URLs."
         )
         return
 
@@ -710,39 +1107,40 @@ async def main():
 
     if not await client.is_user_authorized():
         raise RuntimeError(
-            "Telegram session is not authorized. "
-            "Generate a valid SESSION_STRING."
+            "Telegram session is not authorized."
         )
 
-    print(
-        "[Telegram] Connected. Starting processing.",
-        flush=True
-    )
+    log("[TELEGRAM] Successfully connected.")
+
+    uploaded_count = 0
+    skipped_count = 0
 
     try:
+
         for index, page_url in enumerate(urls, start=1):
 
             if index < START_FROM:
                 continue
 
+            log("")
+            log("========================================")
+            log(f"[{index}/{total}] NEW ITEM")
+            log(f"[SOURCE] {page_url}")
+            log("========================================")
+
             title = f"URL item {index}"
-
-            print(
-                f"\n[{index}/{total}] Processing: {page_url}",
-                flush=True
-            )
-
             status = "SKIPPED"
             details = ""
 
             try:
+
                 for attempt in range(1, MAX_RETRIES + 1):
 
                     try:
-                        print(
-                            f"[Download] Attempt "
-                            f"{attempt}/{MAX_RETRIES}",
-                            flush=True
+
+                        log(
+                            f"[PROCESS] Download attempt "
+                            f"{attempt}/{MAX_RETRIES}"
                         )
 
                         metadata = await asyncio.to_thread(
@@ -752,11 +1150,8 @@ async def main():
 
                         title = metadata["title"]
 
-                        print(
-                            f"[Video] {title} | "
-                            f"{format_size(metadata['size'])} | "
-                            f"{format_duration(metadata['duration'])}",
-                            flush=True
+                        log(
+                            "[PROCESS] Video downloaded successfully."
                         )
 
                         await upload_to_telegram(
@@ -765,69 +1160,67 @@ async def main():
                         )
 
                         status = "UPLOADED"
+                        uploaded_count += 1
 
-                        print(
-                            f"[Success] Uploaded: {title}",
-                            flush=True
+                        log(
+                            f"[SUCCESS] {title} uploaded."
                         )
 
                         break
 
                     except FloodWaitError as exc:
+
                         details = (
-                            f"Telegram FloodWait: wait {exc.seconds}s"
+                            f"Telegram FloodWait: {exc.seconds}s"
                         )
 
                         if attempt < MAX_RETRIES:
+
                             wait_seconds = exc.seconds + 3
 
-                            print(
-                                f"[Telegram] FloodWait; "
-                                f"waiting {wait_seconds}s.",
-                                flush=True
+                            log(
+                                f"[TELEGRAM] FloodWait. "
+                                f"Waiting {wait_seconds} seconds."
                             )
 
                             await asyncio.sleep(wait_seconds)
+
                         else:
                             raise
 
                     except Exception as exc:
-                        details = str(exc)
+
+                        details = clean_text(exc, 500)
+
+                        log(f"[PROCESS ERROR] {details}")
 
                         if attempt < MAX_RETRIES:
-                            print(
-                                f"[Retry] {details}",
-                                flush=True
+
+                            log(
+                                f"[RETRY] Waiting {RETRY_DELAY} seconds."
                             )
 
                             await asyncio.sleep(RETRY_DELAY)
+
                         else:
                             raise
 
             except Exception as exc:
+
                 status = "SKIPPED"
                 details = clean_text(exc, 500)
+                skipped_count += 1
 
-                print(
-                    f"[Failed] {title}: {details}",
-                    flush=True
+                log(
+                    f"[FAILED] Item {index}: {details}"
                 )
 
             finally:
-                # Delete all temporary files.
-                for temp_path in WORK_DIR.iterdir():
-                    if temp_path.is_file():
-                        try:
-                            temp_path.unlink()
-                        except Exception as exc:
-                            print(
-                                f"[Cleanup] Could not delete "
-                                f"{temp_path}: {exc}",
-                                flush=True
-                            )
 
-            # Save every result to GitHub.
-            # The GitHub log is never used to skip queue items.
+                cleanup_files()
+
+            log(f"[RESULT] Item {index}: {status}")
+
             save_github_record(
                 index,
                 status,
@@ -836,13 +1229,24 @@ async def main():
                 details
             )
 
+            log(
+                f"[SUMMARY] Uploaded: {uploaded_count} | "
+                f"Skipped: {skipped_count}"
+            )
+
+            log(f"[QUEUE] Finished item {index}.")
+
     finally:
+
         await client.disconnect()
 
-    print(
-        "\n[Finished] Queue processing completed.",
-        flush=True
-    )
+        log("[TELEGRAM] Disconnected.")
+
+    log("========================================")
+    log("[BOT] ALL SELECTED ITEMS PROCESSED")
+    log(f"[SUMMARY] Uploaded: {uploaded_count}")
+    log(f"[SUMMARY] Skipped: {skipped_count}")
+    log("========================================")
 
 
 # ============================================================
@@ -857,13 +1261,14 @@ if __name__ == "__main__":
     ).start()
 
     try:
+
         asyncio.run(main())
 
     except KeyboardInterrupt:
-        print("Stopped by user.", flush=True)
+
+        log("[BOT] Stopped manually.")
 
     except Exception as error:
-        print(
-            f"[Fatal] {error}",
-            flush=True
-        )
+
+        log(f"[FATAL ERROR] {error}")
+        raise
