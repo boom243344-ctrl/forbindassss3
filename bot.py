@@ -983,8 +983,6 @@ def upload_progress(current, total):
 
 async def upload_to_telegram(metadata, source_url):
 
-    title = metadata["title"]
-
     # Empty caption: no title, file size, or duration text.
     caption = ""
 
@@ -995,7 +993,6 @@ async def upload_to_telegram(metadata, source_url):
         and metadata["width"] > 0
         and metadata["height"] > 0
     ):
-
         attributes.append(
             DocumentAttributeVideo(
                 duration=metadata["duration"],
@@ -1007,35 +1004,25 @@ async def upload_to_telegram(metadata, source_url):
 
     buttons = None
 
-    if GROUP_LINK.startswith(
-        ("https://t.me/", "http://t.me/")
-    ):
-
+    if GROUP_LINK.startswith(("https://t.me/", "http://t.me/")):
         buttons = [
             [Button.url(JOIN_BUTTON_TEXT, GROUP_LINK)]
         ]
+    else:
+        log("[CONFIG] Invalid GROUP_LINK; Join Group button omitted.")
 
     log(
-        f"[TELEGRAM] Uploading {format_size(metadata['size'])} "
-        f"using {TELEGRAM_UPLOAD_WORKERS} workers."
+        f"[TELEGRAM] Starting upload: {format_size(metadata['size'])}. "
+        "Using Telethon send_file upload."
     )
 
     upload_progress.last_percent = -5
 
-    # Concurrent Telegram file-part upload.
-    uploaded_file = await client.upload_file(
-        str(metadata["path"]),
-        file_size=metadata["size"],
-        file_name=f"{title}.mp4",
-        workers=TELEGRAM_UPLOAD_WORKERS,
-        progress_callback=upload_progress
-    )
-
-    log("[TELEGRAM] File transfer finished. Sending to channel.")
-
+    # send_file uploads the local path directly. Do not pass `workers`:
+    # this Telethon version's upload_file() does not accept that argument.
     await client.send_file(
         entity=CHANNEL_ID,
-        file=uploaded_file,
+        file=str(metadata["path"]),
         thumb=(
             str(metadata["thumbnail"])
             if metadata["thumbnail"]
@@ -1044,7 +1031,8 @@ async def upload_to_telegram(metadata, source_url):
         caption=caption,
         supports_streaming=True,
         attributes=attributes or None,
-        buttons=buttons
+        buttons=buttons,
+        progress_callback=upload_progress
     )
 
     log("[TELEGRAM] Upload and message send completed.")
