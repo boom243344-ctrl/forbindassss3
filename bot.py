@@ -14,7 +14,7 @@ from html import unescape
 import requests
 from flask import Flask
 from PIL import Image
-from telethon import TelegramClient, Button
+from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
@@ -904,18 +904,12 @@ async def upload_to_telegram(metadata):
             )
         )
 
-    # Title as caption text above the video
-    caption = title
-
-    # Join button right below caption
-    buttons = None
-
+    # Markdown caption format with text-based join link (fully compatible with user sessions)
     if GROUP_LINK.startswith("https://t.me/"):
-        buttons = [[
-            Button.url(JOIN_BUTTON_TEXT, GROUP_LINK)
-        ]]
+        caption = f"**{title}**\n\n[{JOIN_BUTTON_TEXT} 🔗]({GROUP_LINK})"
     else:
-        log(f"[CONFIG] Invalid or missing GROUP_LINK ({GROUP_LINK}); button omitted.")
+        caption = f"**{title}**"
+        log(f"[CONFIG] Invalid or missing GROUP_LINK ({GROUP_LINK}); link omitted.")
 
     log(
         f"[TELEGRAM] Uploading {title} "
@@ -931,9 +925,9 @@ async def upload_to_telegram(metadata):
             else None
         ),
         caption=caption,
+        parse_mode="md",
         supports_streaming=True,
         attributes=attributes or None,
-        buttons=buttons,
         progress_callback=UploadProgress(),
         part_size_kb=UPLOAD_PART_SIZE_KB
     )
