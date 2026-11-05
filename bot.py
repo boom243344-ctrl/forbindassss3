@@ -38,7 +38,8 @@ CHANNEL_ID = (
 PAGES_FILE = os.getenv("PAGES_FILE", "final_data.txt")
 START_FROM = max(1, int(os.getenv("START_FROM", "1")))
 
-GROUP_LINK = os.getenv("GROUP_LINK", "").strip()
+# Automatically clean quotes or spaces from environment variables
+GROUP_LINK = os.getenv("GROUP_LINK", "").strip().strip('"').strip("'")
 JOIN_BUTTON_TEXT = os.getenv("JOIN_BUTTON_TEXT", "Join Group")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
@@ -906,7 +907,7 @@ async def upload_to_telegram(metadata):
     # Title as caption text above the video
     caption = title
 
-    # Join button right below caption (matches your image reference)
+    # Join button right below caption
     buttons = None
 
     if GROUP_LINK.startswith("https://t.me/"):
@@ -914,7 +915,7 @@ async def upload_to_telegram(metadata):
             Button.url(JOIN_BUTTON_TEXT, GROUP_LINK)
         ]]
     else:
-        log("[CONFIG] Invalid GROUP_LINK; button omitted.")
+        log(f"[CONFIG] Invalid or missing GROUP_LINK ({GROUP_LINK}); button omitted.")
 
     log(
         f"[TELEGRAM] Uploading {title} "
