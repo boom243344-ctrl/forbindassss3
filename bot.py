@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -770,8 +769,6 @@ def download_video(page_url):
 
     video_file = WORK_DIR / "video.mp4"
 
-    # Use the actual page as referer when it is from your
-    # authorized source website.
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
@@ -906,18 +903,16 @@ async def upload_to_telegram(metadata):
             )
         )
 
-    # Title above video; no size or duration text.
+    # Title as caption text above the video
     caption = title
 
-    # Join button below caption.
+    # Join button right below caption (matches your image reference)
     buttons = None
 
     if GROUP_LINK.startswith("https://t.me/"):
-
         buttons = [[
             Button.url(JOIN_BUTTON_TEXT, GROUP_LINK)
         ]]
-
     else:
         log("[CONFIG] Invalid GROUP_LINK; button omitted.")
 
