@@ -6,6 +6,7 @@ import base64
 import asyncio
 import threading
 import subprocess
+import gc
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,11 +63,11 @@ PORT = int(os.getenv("PORT", "10000"))
 MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES", "2")))
 RETRY_DELAY = max(3, int(os.getenv("RETRY_DELAY", "10")))
 
-DOWNLOAD_WORKERS = max(1, min(12, int(os.getenv("DOWNLOAD_WORKERS", "6"))))
-DOWNLOAD_CHUNK_MB = max(4, min(32, int(os.getenv("DOWNLOAD_CHUNK_MB", "16"))))
+DOWNLOAD_WORKERS = max(1, min(12, int(os.getenv("DOWNLOAD_WORKERS", "1"))) )
+DOWNLOAD_CHUNK_MB = max(4, min(32, int(os.getenv("DOWNLOAD_CHUNK_MB", "8"))))
 DOWNLOAD_CHUNK = DOWNLOAD_CHUNK_MB * 1024 * 1024
 
-UPLOAD_PART_SIZE_KB = 512
+UPLOAD_PART_SIZE_KB = 256
 
 WORK_DIR = Path(os.getenv("WORK_DIR", "temp_downloads"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -156,6 +157,8 @@ def cleanup_files():
                 item.unlink()
             except Exception as exc:
                 log(f"[CLEANUP ERROR] {item.name}: {exc}")
+    # Force Python Garbage Collection to clear RAM instantly
+    gc.collect()
 
 
 # ============================================================
@@ -394,11 +397,11 @@ def download_single(video_url, video_file, headers):
 
 
 # ============================================================
-# VIDEO INFORMATION (WITH MOVIEPY FALLBACK)
+# VIDEO INFORMATION (LIGHTWEIGHT METADATA PROBING)
 # ============================================================
 
 def probe_video(video_file):
-    # Try ffprobe first
+    # Try ffprobe first (Zero memory overhead if Aptfile is present)
     try:
         result = subprocess.run(
             [
@@ -425,15 +428,17 @@ def probe_video(video_file):
     except Exception:
         pass
 
-    # Fallback to MoviePy if ffprobe fails or is missing
+    # Fallback to MoviePy with immediate cleanup if ffprobe fails
     try:
         log("[VIDEO] FFprobe unavailable, using MoviePy fallback...")
-        with VideoFileClip(str(video_file)) as clip:
-            duration = int(clip.duration or 0)
-            width = int(clip.w or 1280)
-            height = int(clip.h or 720)
-            log(f"[VIDEO] MoviePy Metadata: {format_duration(duration)} | {width}x{height}")
-            return duration, width, height
+        clip = VideoFileClip(str(video_file))
+        duration = int(clip.duration or 0)
+        width = int(clip.w or 1280)
+        height = int(clip.h or 720)
+        clip.close()  # Free memory immediately
+        gc.collect()
+        log(f"[VIDEO] MoviePy Metadata: {format_duration(duration)} | {width}x{height}")
+        return duration, width, height
     except Exception as exc:
         log(f"[VIDEO] All metadata extraction failed: {exc}")
         return 60, 1280, 720
@@ -593,7 +598,6 @@ async def main():
         log("[QUEUE] START_FROM exceeds queue length.")
         return
 
-    # Initialize client safely inside main()
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.connect()
 
